@@ -3,7 +3,7 @@ data "google_project" "project" {
   project_id = var.project_id
 }
 
-# 2. ATIVAÇÃO DE APIS (Adicionada Cloud Resource Manager para evitar o erro 403)
+# 2. ATIVAÇÃO DE APIS
 resource "google_project_service" "required_apis" {
   for_each = toset([
     "bigquery.googleapis.com",
@@ -19,15 +19,7 @@ resource "google_project_service" "required_apis" {
   disable_on_destroy = false
 }
 
-# 3. FORÇAR CRIAÇÃO DA IDENTIDADE DO DATAFORM (O segredo para evitar o erro 400)
-resource "google_project_service_identity" "dataform_sa" {
-  provider = google-beta
-  project  = var.project_id
-  service  = "dataform.googleapis.com"
-  depends_on = [google_project_service.required_apis]
-}
-
-# 4. SEGURANÇA (SECRET MANAGER)
+# 3. SEGURANÇA (SECRET MANAGER)
 resource "google_secret_manager_secret" "github_token" {
   secret_id = "dataform-github-token"
   replication {
@@ -41,20 +33,28 @@ resource "google_secret_manager_secret_version" "github_token_version" {
   secret_data = var.github_token
 }
 
-# 5. PERMISSÕES (IAM) - Garantindo que o Dataform e o Workflows possam trabalhar
+# 4. FORÇAR CRIAÇÃO DA IDENTIDADE (Evita o erro 400 da SA)
+resource "google_project_service_identity" "dataform_sa" {
+  provider = google-beta
+  project  = var.project_id
+  service  = "dataform.googleapis.com"
+  depends_on = [google_project_service.required_apis]
+}
+
+# 5. PERMISSÕES (IAM) - Dataform acessa o Secret e o BQ
 resource "google_secret_manager_secret_iam_member" "dataform_accessor" {
   secret_id = google_secret_manager_secret.github_token.id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_project_service_identity.dataform_sa.email}"
 }
 
-resource "google_project_iam_member" "dataform_bq_admin" {
+resource "google_project_iam_member" "dataform_bq" {
   project = var.project_id
   role    = "roles/bigquery.admin"
   member  = "serviceAccount:${google_project_service_identity.dataform_sa.email}"
 }
 
-# 6. REPOSITÓRIO DATAFORM (Ajustado para os nomes da V7)
+# 6. REPOSITÓRIO DATAFORM
 resource "google_dataform_repository" "martech_repo" {
   provider = google-beta
   project  = var.project_id
@@ -74,7 +74,16 @@ resource "google_dataform_repository" "martech_repo" {
   depends_on = [google_secret_manager_secret_iam_member.dataform_accessor]
 }
 
-# 7. CONFIGURAÇÃO DO WORKSPACE E PULL (Dinâmico com var.flavor)
+# 7. RELEASE CONFIG (Necessário para o Workflow ler)
+resource "google_dataform_repository_release_config" "manual_release" {
+  provider   = google-beta
+  project    = var.project_id
+  repository = google_dataform_repository.martech_repo.name
+  name       = "manual-release"
+  git_commitish = var.flavor
+}
+
+# 8. CONFIGURAÇÃO DO WORKSPACE E PULL (O ajuste dos 90% -> 100%)
 resource "null_resource" "dataform_setup" {
   provisioner "local-exec" {
     command = <<EOT
@@ -88,90 +97,43 @@ resource "null_resource" "dataform_setup" {
       curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
         "https://dataform.googleapis.com/v1beta1/$REPO_PATH/workspaces?workspaceId=main-workspace" || echo "Workspace já existe."
 
-      echo "Sincronizando arquivos da branch ${var.flavor}..."
+      echo "Sincronizando branch ${var.flavor}..."
       curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
         -d '{"remoteBranch": "${var.flavor}"}' \
         "https://dataform.googleapis.com/v1beta1/$REPO_PATH/workspaces/main-workspace:fetchRemoteAndMerge"
 EOT
   }
-
   depends_on = [google_dataform_repository.martech_repo]
 }
 
-Com certeza, Matheus! É totalmente possível. Em vez de chamar um arquivo externo, vamos embutir o código do orquestrador diretamente dentro do seu main.tf usando uma funcionalidade do Terraform chamada Heredoc.
-
-Isso deixa o seu repositório de infraestrutura muito mais "limpo", com apenas os arquivos .tf, o que é excelente para evitar aquele erro de "arquivo não encontrado" que vimos agora.
-
-🛠️ Ajuste no main.tf: Orquestrador Embutido (Inline)
-Substitua o recurso google_workflows_workflow pelo código abaixo. Note que usei <<-EOF para escrever o YAML direto no Terraform:
-
-Terraform
-# 8. ORQUESTRADOR (CLOUD WORKFLOWS) - Agora Inline (Sem arquivo externo)
+# 9. ORQUESTRADOR (CLOUD WORKFLOWS)
 resource "google_workflows_workflow" "orchestrator" {
   name            = "martech-orchestrator"
   region          = "us-east1"
   project         = var.project_id
-  description     = "Executa o pipeline do Dataform via Toolkit v7"
+  description     = "Executa o pipeline via Toolkit v7"
   service_account = "${data.google_project.project.number}-compute@developer.gserviceaccount.com"
 
-  source_contents = <<-EOF
-    main:
-      steps:
-        - init:
-            assign:
-              - repository: "projects/$${var.project_id}/locations/us-east1/repositories/toolkit-martech-engine"
-              - releaseConfig: "$${repository}/releaseConfigs/manual-release"
-        
-        - createCompilation:
-            call: http.post
-            args:
-              url: "$${repository}/compilationResults"
-              auth:
-                type: OAuth2
-              body:
-                releaseConfig: "$${releaseConfig}"
-            result: compilationResult
+  source_contents = file("${path.module}/main_orchestrator.yaml")
 
-        - createInvocation:
-            call: http.post
-            args:
-              url: "$${repository}/workflowInvocations"
-              auth:
-                type: OAuth2
-              body:
-                compilationResult: "$${compilationResult.body.name}"
-                invocationConfig:
-                  includedTags: []
-                  transitiveDependenciesIncluded: true
-                  transitiveDependentsIncluded: false
-            result: invocationResult
-
-        - returnResult:
-            return: "$${invocationResult.body}"
-  EOF
-
-  depends_on = [google_project_service.required_apis]
+  depends_on = [google_project_service.required_apis, google_dataform_repository.martech_repo]
 }
 
-# 9. AGENDAMENTO (CLOUD SCHEDULER)
+# 10. AGENDAMENTO (CLOUD SCHEDULER)
 resource "google_cloud_scheduler_job" "daily_trigger" {
   name             = "daily-martech-sync"
-  description      = "Gatilho diário para o Workflow"
   schedule         = "0 6 * * *"
   time_zone        = "America/Sao_Paulo"
   region           = "us-east1"
   project          = var.project_id
-  attempt_deadline = "320s"
 
   http_target {
     http_method = "POST"
     uri         = "https://workflowexecutions.googleapis.com/v1/${google_workflows_workflow.orchestrator.id}/executions"
     body        = base64encode("{}")
-
     oauth_token {
       service_account_email = "${data.google_project.project.number}-compute@developer.gserviceaccount.com"
     }
   }
-
   depends_on = [google_workflows_workflow.orchestrator]
 }
