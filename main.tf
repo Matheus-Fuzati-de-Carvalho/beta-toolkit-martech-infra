@@ -83,30 +83,35 @@ resource "google_dataform_repository_release_config" "manual_release" {
   git_commitish = var.flavor
 }
 
-# 8. CONFIGURAÇÃO DO WORKSPACE E PULL (O ajuste dos 90% -> 100%)
+# 8. CONFIGURAÇÃO DO WORKSPACE E PULL (Correção do Endpoint :pull)
 resource "null_resource" "dataform_setup" {
   provisioner "local-exec" {
     command = <<EOT
       TOKEN=$(gcloud auth print-access-token)
       REPO_PATH="projects/${var.project_id}/locations/us-east1/repositories/${google_dataform_repository.martech_repo.name}"
       
-      echo "Aguardando estabilização..."
-      sleep 30
+      echo "Aguardando estabilização final..."
+      sleep 40
 
       echo "Criando Workspace: main-workspace..."
       curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
         "https://dataform.googleapis.com/v1beta1/$REPO_PATH/workspaces?workspaceId=main-workspace" || echo "Workspace já existe."
 
-      echo "Sincronizando branch ${var.flavor}..."
+      echo "Sincronizando branch ${var.flavor} via Pull..."
       curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-        -d '{"remoteBranch": "${var.flavor}"}' \
-        "https://dataform.googleapis.com/v1beta1/$REPO_PATH/workspaces/main-workspace:fetchRemoteAndMerge"
+        "https://dataform.googleapis.com/v1beta1/$REPO_PATH/workspaces/main-workspace:pull"
 EOT
   }
   depends_on = [google_dataform_repository.martech_repo]
 }
 
-# 9. ORQUESTRADOR (CLOUD WORKFLOWS)
+# 9. PAUSA DE SEGURANÇA PARA IAM (Garante que a Service Account exista no backend)
+resource "time_sleep" "wait_for_iam" {
+  depends_on = [google_project_service.required_apis]
+  create_duration = "30s"
+}
+
+# 10. ORQUESTRADOR (CLOUD WORKFLOWS)
 resource "google_workflows_workflow" "orchestrator" {
   name            = "martech-orchestrator"
   region          = "us-east1"
@@ -116,24 +121,6 @@ resource "google_workflows_workflow" "orchestrator" {
 
   source_contents = file("${path.module}/main_orchestrator.yaml")
 
-  depends_on = [google_project_service.required_apis, google_dataform_repository.martech_repo]
-}
-
-# 10. AGENDAMENTO (CLOUD SCHEDULER)
-resource "google_cloud_scheduler_job" "daily_trigger" {
-  name             = "daily-martech-sync"
-  schedule         = "0 6 * * *"
-  time_zone        = "America/Sao_Paulo"
-  region           = "us-east1"
-  project          = var.project_id
-
-  http_target {
-    http_method = "POST"
-    uri         = "https://workflowexecutions.googleapis.com/v1/${google_workflows_workflow.orchestrator.id}/executions"
-    body        = base64encode("{}")
-    oauth_token {
-      service_account_email = "${data.google_project.project.number}-compute@developer.gserviceaccount.com"
-    }
-  }
-  depends_on = [google_workflows_workflow.orchestrator]
+  # Importante: Depender da pausa de segurança
+  depends_on = [time_sleep.wait_for_iam, google_dataform_repository.martech_repo]
 }
