@@ -1,11 +1,18 @@
+terraform {
+  required_providers {
+    time = { source = "hashicorp/time" }
+  }
+}
+
 # 1. DADOS DO PROJETO
 data "google_project" "project" {
   project_id = var.project_id
 }
 
-# 2. ATIVAÇÃO DE APIS
+# 2. ATIVAÇÃO DE APIS (Adicionada compute.googleapis.com)
 resource "google_project_service" "required_apis" {
   for_each = toset([
+    "compute.googleapis.com", # <--- ESSENCIAL para a conta -compute@ existir
     "bigquery.googleapis.com",
     "dataform.googleapis.com",
     "workflows.googleapis.com",
@@ -19,7 +26,7 @@ resource "google_project_service" "required_apis" {
   disable_on_destroy = false
 }
 
-# 3. FORÇAR CRIAÇÃO DA IDENTIDADE DO DATAFORM (Mata o erro 400)
+# 3. FORÇAR CRIAÇÃO DA IDENTIDADE DO DATAFORM
 resource "google_project_service_identity" "dataform_sa" {
   provider = google-beta
   project  = var.project_id
@@ -30,9 +37,7 @@ resource "google_project_service_identity" "dataform_sa" {
 # 4. SEGURANÇA (SECRET MANAGER)
 resource "google_secret_manager_secret" "github_token" {
   secret_id = "dataform-github-token"
-  replication {
-    auto {}
-  }
+  replication { auto {} }
   depends_on = [google_project_service.required_apis]
 }
 
@@ -41,16 +46,13 @@ resource "google_secret_manager_secret_version" "github_token_version" {
   secret_data = var.github_token
 }
 
-# 5. PAUSA TÉCNICA (30s para propagação de APIs e Identidades)
+# 5. PAUSA TÉCNICA (Aumentada para 45s para garantir que o Compute crie a SA)
 resource "time_sleep" "wait_for_propagation" {
-  depends_on = [
-    google_project_service_identity.dataform_sa,
-    google_project_service.required_apis
-  ]
-  create_duration = "30s"
+  depends_on = [google_project_service.required_apis, google_project_service_identity.dataform_sa]
+  create_duration = "45s"
 }
 
-# 6. PERMISSÕES DE IAM (DATAFORM E WORKFLOW)
+# 6. PERMISSÕES DE IAM
 resource "google_secret_manager_secret_iam_member" "dataform_accessor" {
   secret_id = google_secret_manager_secret.github_token.id
   role      = "roles/secretmanager.secretAccessor"
@@ -63,11 +65,12 @@ resource "google_project_iam_member" "dataform_bq" {
   member  = "serviceAccount:${google_project_service_identity.dataform_sa.email}"
 }
 
-# Dá ao Workflow (Compute SA) poder para rodar o Dataform
+# Permissão para o Workflow (Compute SA)
 resource "google_project_iam_member" "workflow_dataform_editor" {
   project = var.project_id
   role    = "roles/dataform.editor"
   member  = "serviceAccount:${data.google_project.project.number}-compute@developer.gserviceaccount.com"
+  depends_on = [time_sleep.wait_for_propagation]
 }
 
 # 7. REPOSITÓRIO DATAFORM
@@ -76,21 +79,16 @@ resource "google_dataform_repository" "martech_repo" {
   project  = var.project_id
   name     = "toolkit-martech-engine"
   region   = "us-east1"
-
   git_remote_settings {
     url                                 = var.github_repo_url
     default_branch                      = var.flavor
     authentication_token_secret_version = google_secret_manager_secret_version.github_token_version.id
   }
-
-  workspace_compilation_overrides {
-    default_database = var.project_id
-  }
-
+  workspace_compilation_overrides { default_database = var.project_id }
   depends_on = [time_sleep.wait_for_propagation, google_secret_manager_secret_iam_member.dataform_accessor]
 }
 
-# 8. RELEASE CONFIG (Compilação manual referenciada pelo Workflow)
+# 8. RELEASE CONFIG
 resource "google_dataform_repository_release_config" "manual_release" {
   provider   = google-beta
   project    = var.project_id
@@ -99,66 +97,52 @@ resource "google_dataform_repository_release_config" "manual_release" {
   git_commitish = var.flavor
 }
 
-# 9. SETUP DO WORKSPACE (Criação e Pull via API)
+# 9. SETUP DO WORKSPACE
 resource "null_resource" "dataform_setup" {
   provisioner "local-exec" {
     command = <<EOT
       TOKEN=$(gcloud auth print-access-token)
       REPO_PATH="projects/${var.project_id}/locations/us-east1/repositories/${google_dataform_repository.martech_repo.name}"
-      
-      echo "Aguardando estabilização final do repositório..."
       sleep 40
-
-      echo "Criando Workspace: main-workspace..."
-      curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-        "https://dataform.googleapis.com/v1beta1/$REPO_PATH/workspaces?workspaceId=main-workspace" || echo "Workspace já existe."
-
-      echo "Sincronizando branch ${var.flavor} via Pull..."
-      curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-        "https://dataform.googleapis.com/v1beta1/$REPO_PATH/workspaces/main-workspace:pull"
+      curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "https://dataform.googleapis.com/v1beta1/$REPO_PATH/workspaces?workspaceId=main-workspace" || echo "Workspace já existe."
+      curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "https://dataform.googleapis.com/v1beta1/$REPO_PATH/workspaces/main-workspace:pull"
 EOT
   }
   depends_on = [google_dataform_repository.martech_repo]
 }
 
-# 10. ORQUESTRADOR (CLOUD WORKFLOWS)
+# 10. ORQUESTRADOR
 resource "google_workflows_workflow" "orchestrator" {
   name            = "martech-orchestrator"
   region          = "us-east1"
   project         = var.project_id
   description     = "Executa o pipeline via Toolkit v7"
   service_account = "${data.google_project.project.number}-compute@developer.gserviceaccount.com"
-
   source_contents = file("${path.module}/main_orchestrator.yaml")
-
-  depends_on = [google_dataform_repository.martech_repo, google_project_iam_member.workflow_dataform_editor]
+  depends_on      = [google_dataform_repository.martech_repo, google_project_iam_member.workflow_dataform_editor]
 }
 
-# 11. AGENDAMENTO (CLOUD SCHEDULER)
+# 11. SCHEDULER E PERMISSÃO DE INVOCADOR
 resource "google_cloud_scheduler_job" "daily_trigger" {
   name             = "daily-martech-sync"
-  description      = "Gatilho diário para o Workflow de Martech"
-  schedule         = "0 6 * * *" # Todos os dias às 06h
+  schedule         = "0 6 * * *"
   time_zone        = "America/Sao_Paulo"
   region           = "us-east1"
   project          = var.project_id
-
   http_target {
     http_method = "POST"
     uri         = "https://workflowexecutions.googleapis.com/v1/${google_workflows_workflow.orchestrator.id}/executions"
     body        = base64encode("{}")
-
     oauth_token {
       service_account_email = "${data.google_project.project.number}-compute@developer.gserviceaccount.com"
     }
   }
-
   depends_on = [google_workflows_workflow.orchestrator]
 }
 
-# Permissão para o Scheduler chamar o Workflow
 resource "google_project_iam_member" "scheduler_workflow_invoker" {
   project = var.project_id
   role    = "roles/workflows.invoker"
   member  = "serviceAccount:${data.google_project.project.number}-compute@developer.gserviceaccount.com"
+  depends_on = [time_sleep.wait_for_propagation]
 }
