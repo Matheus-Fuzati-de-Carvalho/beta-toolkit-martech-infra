@@ -98,7 +98,15 @@ EOT
   depends_on = [google_dataform_repository.martech_repo]
 }
 
-# 8. ORQUESTRADOR (CLOUD WORKFLOWS)
+Com certeza, Matheus! É totalmente possível. Em vez de chamar um arquivo externo, vamos embutir o código do orquestrador diretamente dentro do seu main.tf usando uma funcionalidade do Terraform chamada Heredoc.
+
+Isso deixa o seu repositório de infraestrutura muito mais "limpo", com apenas os arquivos .tf, o que é excelente para evitar aquele erro de "arquivo não encontrado" que vimos agora.
+
+🛠️ Ajuste no main.tf: Orquestrador Embutido (Inline)
+Substitua o recurso google_workflows_workflow pelo código abaixo. Note que usei <<-EOF para escrever o YAML direto no Terraform:
+
+Terraform
+# 8. ORQUESTRADOR (CLOUD WORKFLOWS) - Agora Inline (Sem arquivo externo)
 resource "google_workflows_workflow" "orchestrator" {
   name            = "martech-orchestrator"
   region          = "us-east1"
@@ -106,8 +114,41 @@ resource "google_workflows_workflow" "orchestrator" {
   description     = "Executa o pipeline do Dataform via Toolkit v7"
   service_account = "${data.google_project.project.number}-compute@developer.gserviceaccount.com"
 
-  # Certifique-se que o arquivo main_orchestrator.yaml existe na mesma pasta
-  source_contents = file("${path.module}/main_orchestrator.yaml")
+  source_contents = <<-EOF
+    main:
+      steps:
+        - init:
+            assign:
+              - repository: "projects/$${var.project_id}/locations/us-east1/repositories/toolkit-martech-engine"
+              - releaseConfig: "$${repository}/releaseConfigs/manual-release"
+        
+        - createCompilation:
+            call: http.post
+            args:
+              url: "$${repository}/compilationResults"
+              auth:
+                type: OAuth2
+              body:
+                releaseConfig: "$${releaseConfig}"
+            result: compilationResult
+
+        - createInvocation:
+            call: http.post
+            args:
+              url: "$${repository}/workflowInvocations"
+              auth:
+                type: OAuth2
+              body:
+                compilationResult: "$${compilationResult.body.name}"
+                invocationConfig:
+                  includedTags: []
+                  transitiveDependenciesIncluded: true
+                  transitiveDependentsIncluded: false
+            result: invocationResult
+
+        - returnResult:
+            return: "$${invocationResult.body}"
+  EOF
 
   depends_on = [google_project_service.required_apis]
 }
