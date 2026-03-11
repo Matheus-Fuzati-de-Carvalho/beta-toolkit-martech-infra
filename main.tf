@@ -1,78 +1,136 @@
-# 1. APIs Necessárias
-resource "google_project_service" "services" {
+# 1. PEGAR O NÚMERO DO PROJETO DINAMICAMENTE
+data "google_project" "project" {
+  project_id = var.project_id
+}
+
+# 2. ATIVAÇÃO DE APIS (Adicionada Cloud Resource Manager para evitar o erro 403)
+resource "google_project_service" "required_apis" {
   for_each = toset([
-    "dataform.googleapis.com",
-    "secretmanager.googleapis.com",
     "bigquery.googleapis.com",
-    "cloudscheduler.googleapis.com"
+    "dataform.googleapis.com",
+    "workflows.googleapis.com",
+    "cloudscheduler.googleapis.com",
+    "secretmanager.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+    "iam.googleapis.com"
   ])
-  service = each.key
+  project            = var.project_id
+  service            = each.key
   disable_on_destroy = false
 }
 
-# 2. Secret Manager (Sintaxe v5.x corrigida)
-resource "google_secret_manager_secret" "github_token_secret" {
-  secret_id = "github-token-dataform"
+# 3. FORÇAR CRIAÇÃO DA IDENTIDADE DO DATAFORM (O segredo para evitar o erro 400)
+resource "google_project_service_identity" "dataform_sa" {
+  provider = google-beta
+  project  = var.project_id
+  service  = "dataform.googleapis.com"
+  depends_on = [google_project_service.required_apis]
+}
+
+# 4. SEGURANÇA (SECRET MANAGER)
+resource "google_secret_manager_secret" "github_token" {
+  secret_id = "dataform-github-token"
   replication {
-    auto {} # Correção do erro 'automatic'
+    auto {}
   }
-  depends_on = [google_project_service.services]
+  depends_on = [google_project_service.required_apis]
 }
 
 resource "google_secret_manager_secret_version" "github_token_version" {
-  secret      = google_secret_manager_secret.github_token_secret.id
+  secret      = google_secret_manager_secret.github_token.id
   secret_data = var.github_token
 }
 
-# 3. Repositório Dataform
+# 5. PERMISSÕES (IAM) - Garantindo que o Dataform e o Workflows possam trabalhar
+resource "google_secret_manager_secret_iam_member" "dataform_accessor" {
+  secret_id = google_secret_manager_secret.github_token.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_project_service_identity.dataform_sa.email}"
+}
+
+resource "google_project_iam_member" "dataform_bq_admin" {
+  project = var.project_id
+  role    = "roles/bigquery.admin"
+  member  = "serviceAccount:${google_project_service_identity.dataform_sa.email}"
+}
+
+# 6. REPOSITÓRIO DATAFORM (Ajustado para os nomes da V7)
 resource "google_dataform_repository" "martech_repo" {
   provider = google-beta
+  project  = var.project_id
   name     = "toolkit-martech-engine"
-  region   = var.region
+  region   = "us-east1"
 
   git_remote_settings {
-    url                                = var.github_repo_url
-    default_branch                     = var.flavor
+    url                                 = var.github_repo_url
+    default_branch                      = var.flavor
     authentication_token_secret_version = google_secret_manager_secret_version.github_token_version.id
   }
 
   workspace_compilation_overrides {
     default_database = var.project_id
   }
+
+  depends_on = [google_secret_manager_secret_iam_member.dataform_accessor]
 }
 
-# 4. Release Config (SEM AGENDAMENTO AUTOMÁTICO)
-resource "google_dataform_repository_release_config" "daily_release" {
-  provider      = google-beta
-  repository    = google_dataform_repository.martech_repo.name
-  name          = "manual-release"
-  git_commitish = var.flavor
-  # Removido o cron_schedule para garantir que o vínculo não seja automático
-}
+# 7. CONFIGURAÇÃO DO WORKSPACE E PULL (Dinâmico com var.flavor)
+resource "null_resource" "dataform_setup" {
+  provisioner "local-exec" {
+    command = <<EOT
+      TOKEN=$(gcloud auth print-access-token)
+      REPO_PATH="projects/${var.project_id}/locations/us-east1/repositories/${google_dataform_repository.martech_repo.name}"
+      
+      echo "Aguardando estabilização..."
+      sleep 30
 
-# 5. Workflow Config
-resource "google_dataform_repository_workflow_config" "full_workflow" {
-  provider       = google-beta
-  repository     = google_dataform_repository.martech_repo.name
-  name           = "full-execution"
-  release_config = google_dataform_repository_release_config.daily_release.id
-  
-  invocation_config {
-    transitive_dependencies_included = true
+      echo "Criando Workspace: main-workspace..."
+      curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        "https://dataform.googleapis.com/v1beta1/$REPO_PATH/workspaces?workspaceId=main-workspace" || echo "Workspace já existe."
+
+      echo "Sincronizando arquivos da branch ${var.flavor}..."
+      curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"remoteBranch": "${var.flavor}"}' \
+        "https://dataform.googleapis.com/v1beta1/$REPO_PATH/workspaces/main-workspace:fetchRemoteAndMerge"
+EOT
   }
+
+  depends_on = [google_dataform_repository.martech_repo]
 }
 
-# 6. IAM e Permissões (Obrigatório para o Dataform funcionar)
-data "google_project" "project" {}
+# 8. ORQUESTRADOR (CLOUD WORKFLOWS)
+resource "google_workflows_workflow" "orchestrator" {
+  name            = "martech-orchestrator"
+  region          = "us-east1"
+  project         = var.project_id
+  description     = "Executa o pipeline do Dataform via Toolkit v7"
+  service_account = "${data.google_project.project.number}-compute@developer.gserviceaccount.com"
 
-resource "google_project_iam_member" "dataform_bq_admin" {
-  project = var.project_id
-  role    = "roles/bigquery.admin"
-  member  = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-dataform.iam.gserviceaccount.com"
+  # Certifique-se que o arquivo main_orchestrator.yaml existe na mesma pasta
+  source_contents = file("${path.module}/main_orchestrator.yaml")
+
+  depends_on = [google_project_service.required_apis]
 }
 
-resource "google_secret_manager_secret_iam_member" "dataform_secret_accessor" {
-  secret_id = google_secret_manager_secret.github_token_secret.id
-  role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-dataform.iam.gserviceaccount.com"
+# 9. AGENDAMENTO (CLOUD SCHEDULER)
+resource "google_cloud_scheduler_job" "daily_trigger" {
+  name             = "daily-martech-sync"
+  description      = "Gatilho diário para o Workflow"
+  schedule         = "0 6 * * *"
+  time_zone        = "America/Sao_Paulo"
+  region           = "us-east1"
+  project          = var.project_id
+  attempt_deadline = "320s"
+
+  http_target {
+    http_method = "POST"
+    uri         = "https://workflowexecutions.googleapis.com/v1/${google_workflows_workflow.orchestrator.id}/executions"
+    body        = base64encode("{}")
+
+    oauth_token {
+      service_account_email = "${data.google_project.project.number}-compute@developer.gserviceaccount.com"
+    }
+  }
+
+  depends_on = [google_workflows_workflow.orchestrator]
 }
