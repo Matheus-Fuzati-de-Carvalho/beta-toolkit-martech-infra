@@ -1,3 +1,10 @@
+terraform {
+  required_providers {
+    time = {
+      source = "hashicorp/time"
+    }
+  }
+}
 # 1. PEGAR O NÚMERO DO PROJETO DINAMICAMENTE
 data "google_project" "project" {
   project_id = var.project_id
