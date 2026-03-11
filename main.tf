@@ -10,10 +10,13 @@ resource "google_project_service" "services" {
   disable_on_destroy = false
 }
 
-# 2. Secret Manager para o GitHub Token
+# 2. Secret Manager para o GitHub Token (Sintaxe Corrigida v5.x)
 resource "google_secret_manager_secret" "github_token_secret" {
   secret_id = "github-token-dataform"
-  replication { automatic = true }
+  replication {
+    auto {} # Esta é a nova forma de dizer 'automatic = true'
+  }
+  depends_on = [google_project_service.services]
 }
 
 resource "google_secret_manager_secret_version" "github_token_version" {
