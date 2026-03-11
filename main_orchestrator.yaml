@@ -2,20 +2,24 @@ main:
   steps:
     - init:
         assign:
-          - repository: ${"projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT_ID") + "/locations/us-east1/repositories/toolkit-martech-engine"}
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - repository_path: ${"projects/" + project_id + "/locations/us-east1/repositories/toolkit-martech-engine"}
+          - base_url: "https://dataform.googleapis.com/v1beta1/"
+    
     - createCompilation:
         call: http.post
         args:
-          url: ${repository + "/compilationResults"}
+          url: ${base_url + repository_path + "/compilationResults"}
           auth:
             type: OAuth2
           body:
-            releaseConfig: ${repository + "/releaseConfigs/manual-release"}
+            releaseConfig: ${repository_path + "/releaseConfigs/manual-release"}
         result: compilationResult
+
     - createInvocation:
         call: http.post
         args:
-          url: ${repository + "/workflowInvocations"}
+          url: ${base_url + repository_path + "/workflowInvocations"}
           auth:
             type: OAuth2
           body:
@@ -24,5 +28,6 @@ main:
               includedTags: []
               transitiveDependenciesIncluded: true
         result: invocationResult
+
     - returnResult:
         return: ${invocationResult.body}
