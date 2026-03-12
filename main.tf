@@ -130,7 +130,10 @@ resource "google_workflows_workflow" "orchestrator" {
   description     = "Executa o pipeline via Toolkit v7"
   service_account = "${data.google_project.project.number}-compute@developer.gserviceaccount.com"
 
-  source_contents = file("${path.module}/main_orchestrator.yaml")
+  # Aqui está o pulo do gato: Injetamos o flavor (branch) dinamicamente no YAML
+  source_contents = templatefile("${path.module}/main_orchestrator.yaml", {
+    flavor = var.flavor
+  })
 
   depends_on = [google_dataform_repository.martech_repo, google_project_iam_member.workflow_dataform_editor]
 }

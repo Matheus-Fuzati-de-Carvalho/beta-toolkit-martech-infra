@@ -2,32 +2,36 @@ main:
   steps:
     - init:
         assign:
-          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
-          - repository_path: ${"projects/" + project_id + "/locations/us-east1/repositories/toolkit-martech-engine"}
+          - project_id: $${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - repository_path: $${"projects/" + project_id + "/locations/us-east1/repositories/toolkit-martech-engine"}
           - base_url: "https://dataform.googleapis.com/v1beta1/"
+          # Esta variável abaixo vem do Terraform (flavor):
+          - branch_name: "${flavor}" 
     
     - createCompilation:
         call: http.post
         args:
-          url: ${base_url + repository_path + "/compilationResults"}
+          url: $${base_url + repository_path + "/compilationResults"}
           auth:
             type: OAuth2
           body:
-            releaseConfig: ${repository_path + "/releaseConfigs/manual-release"}
+            gitCommitish: $${branch_name}
+            codeCompilationConfig:
+              defaultDatabase: $${project_id} # Resolve o erro de "Empty Project ID"
         result: compilationResult
 
     - createInvocation:
         call: http.post
         args:
-          url: ${base_url + repository_path + "/workflowInvocations"}
+          url: $${base_url + repository_path + "/workflowInvocations"}
           auth:
             type: OAuth2
           body:
-            compilationResult: ${compilationResult.body.name}
+            compilationResult: $${compilationResult.body.name}
             invocationConfig:
               includedTags: []
               transitiveDependenciesIncluded: true
         result: invocationResult
 
     - returnResult:
-        return: ${invocationResult.body}
+        return: $${invocationResult.body}
